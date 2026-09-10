@@ -1,0 +1,157 @@
+# Preflight for .gitlab-ci.yml — replays what the Libretro buildbot runs, on
+# GitHub runners with equivalent toolchains, because the buildbot's own
+# registry (git.libretro.com:5050) is not reachable from here.
+#
+#   buildbot job                 image / tag                          stand-in here
+#   libretro-build-linux-x64     libretro-build-amd64-ubuntu:xenial-gcc9   ubuntu:focal container (gcc 9)
+#   libretro-build-linux-i686    libretro-build-i386-ubuntu:xenial-gcc9    i386/ubuntu:focal container
+#   libretro-build-linux-aarch64 libretro-build-aarch64-ubuntu:latest      ubuntu-24.04-arm
+#   libretro-build-windows-*     libretro-build-mxe-win-cross-cores:gcc11  Ubuntu mingw-w64 (posix threads)
+#   libretro-build-osx-x64       macosx tag                               macos-15-intel
+#   libretro-build-osx-arm64     mac-apple-silicon tag                    macos-15
+#   android-*                    libretro-build-android:latest            NDK on ubuntu-latest
+name: Buildbot preflight
+
+on:
+  push:
+    branches: [ci-preflight]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+            image: ubuntu:focal
+            docker_platform: linux/amd64
+          - name: linux-i686
+            runner: ubuntu-latest
+            image: i386/ubuntu:focal
+            docker_platform: linux/386
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          docker run --rm --platform ${{ matrix.docker_platform }} \
+            -v "$PWD":/src -w /src ${{ matrix.image }} sh -c '
+              set -e
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -yqq build-essential zlib1g-dev
+              gcc --version | head -1
+              make -C . -f libretro/Makefile.libretro -j$(nproc)
+            '
+      - name: Check artifact
+        run: |
+          file mednafen_stv_libretro.so
+          nm -D --defined-only mednafen_stv_libretro.so | grep -c retro_run
+          readelf -d mednafen_stv_libretro.so | grep NEEDED
+
+  linux-aarch64:
+    name: linux-aarch64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -yqq build-essential zlib1g-dev
+      - run: make -C . -f libretro/Makefile.libretro -j$(nproc)
+      - name: Check artifact
+        run: |
+          file mednafen_stv_libretro.so
+          nm -D --defined-only mednafen_stv_libretro.so | grep -c retro_run
+          readelf -d mednafen_stv_libretro.so | grep NEEDED
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            platform: win64
+            triple: x86_64-w64-mingw32
+            pkg: g++-mingw-w64-x86-64
+          - name: windows-i686
+            platform: win32
+            triple: i686-w64-mingw32
+            pkg: g++-mingw-w64-i686
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -yqq ${{ matrix.pkg }}
+      - name: Build
+        env:
+          platform: ${{ matrix.platform }}
+          CC: ${{ matrix.triple }}-gcc-posix
+          CXX: ${{ matrix.triple }}-g++-posix
+          AR: ${{ matrix.triple }}-ar
+        run: |
+          # MXE ships zlib for the cross target; Ubuntu's mingw does not, so
+          # build the one the core needs before the core itself.
+          ZVER=1.3.1
+          curl -sL https://zlib.net/fossils/zlib-$ZVER.tar.gz | tar xz
+          make -C zlib-$ZVER -f win32/Makefile.gcc -j$(nproc) \
+            PREFIX=${{ matrix.triple }}- CC=$CC libz.a
+          sudo cp zlib-$ZVER/libz.a /usr/${{ matrix.triple }}/lib/
+          sudo cp zlib-$ZVER/zlib.h zlib-$ZVER/zconf.h /usr/${{ matrix.triple }}/include/
+          make -C . -f libretro/Makefile.libretro -j$(nproc)
+      - name: Check artifact
+        run: |
+          file mednafen_stv_libretro.dll
+          ${{ matrix.triple }}-nm -g --defined-only mednafen_stv_libretro.dll | grep -c retro_run
+
+  osx:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: osx-x64
+            runner: macos-15-intel
+            apple_platform: ""
+          - name: osx-arm64
+            runner: macos-15
+            apple_platform: arm64-apple-macos10.15
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        env:
+          platform: osx
+          CC: clang
+          CXX: clang++
+          LIBRETRO_APPLE_PLATFORM: ${{ matrix.apple_platform }}
+        run: |
+          if [ -n "$LIBRETRO_APPLE_PLATFORM" ]; then
+            export LIBRETRO_APPLE_ISYSROOT=$(xcodebuild -version -sdk macosx Path)
+          fi
+          make -C . -f libretro/Makefile.libretro -j$(sysctl -n hw.logicalcpu)
+      - name: Check artifact
+        run: |
+          file mednafen_stv_libretro.dylib
+          lipo -info mednafen_stv_libretro.dylib
+          nm -gU mednafen_stv_libretro.dylib | grep -c retro_run
+          otool -L mednafen_stv_libretro.dylib
+
+  android:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [android-arm, android-arm64, android-x86, android-x86_64]
+    name: ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          make -C . -f libretro/Makefile.libretro -j$(nproc) \
+            platform=${{ matrix.platform }} \
+            ANDROID_NDK_ROOT="$ANDROID_NDK_LATEST_HOME"
+      - name: Check artifact
+        run: |
+          file mednafen_stv_libretro_android.so
+          nm -D --defined-only mednafen_stv_libretro_android.so | grep -c retro_run
+          readelf -d mednafen_stv_libretro_android.so | grep NEEDED
